@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"strings"
 
 	"github.com/dustin/go-humanize"
@@ -31,8 +32,6 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/juju/core/constraints"
 	jujustorage "github.com/juju/juju/storage"
-	"github.com/juju/utils/v3"
-
 	"github.com/juju/terraform-provider-juju/internal/juju"
 )
 
@@ -81,16 +80,17 @@ type applicationResource struct {
 // applicationResourceModel describes the application data model.
 // tfsdk must match user resource schema attribute names.
 type applicationResourceModel struct {
-	ApplicationName  types.String `tfsdk:"name"`
-	Charm            types.List   `tfsdk:"charm"`
-	Config           types.Map    `tfsdk:"config"`
-	Constraints      types.String `tfsdk:"constraints"`
-	Expose           types.List   `tfsdk:"expose"`
-	ModelName        types.String `tfsdk:"model"`
-	Placement        types.String `tfsdk:"placement"`
-	EndpointBindings types.Set    `tfsdk:"endpoint_bindings"`
-	Resources        types.Map    `tfsdk:"resources"`
-	Storage          types.Set    `tfsdk:"storage"`
+	ApplicationName   types.String `tfsdk:"name"`
+	Charm             types.List   `tfsdk:"charm"`
+	Config            types.Map    `tfsdk:"config"`
+	Constraints       types.String `tfsdk:"constraints"`
+	Expose            types.List   `tfsdk:"expose"`
+	ModelName         types.String `tfsdk:"model"`
+	Placement         types.String `tfsdk:"placement"`
+	EndpointBindings  types.Set    `tfsdk:"endpoint_bindings"`
+	Resources         types.Map    `tfsdk:"resources"`
+	StorageDirectives types.Map    `tfsdk:"storage_directives"`
+	Storage           types.Set    `tfsdk:"storage"`
 	// TODO - remove Principal when we version the schema
 	// and remove deprecated elements. Once we create upgrade
 	// functionality it can be removed from the structure.
@@ -170,30 +170,41 @@ func (r *applicationResource) Schema(_ context.Context, _ resource.SchemaRequest
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			"storage_directives": schema.MapAttribute{
+				Description: "Storage directives (constraints) for the juju application. " +
+					"The map key is the label of the storage defined by the charm, " +
+					"the map value is the storage directive in the form <pool>,<count>,<size>.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Validators: []validator.Map{
+					stringIsStorageDirectiveValidator{},
+				},
+				PlanModifiers: []planmodifier.Map{
+					mapplanmodifier.RequiresReplaceIf(storageDirectivesMapRequiresReplace, "", ""),
+				},
+			},
 			"storage": schema.SetNestedAttribute{
-				Description: "Configure storage constraints for the juju application.",
+				Description: "Storage used by the application.",
 				Optional:    true,
 				Computed:    true,
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"label": schema.StringAttribute{
 							Description: "The specific storage option defined in the charm.",
-							Required:    true,
+							Computed:    true,
 							PlanModifiers: []planmodifier.String{
 								stringplanmodifier.UseStateForUnknown(),
 							},
 						},
 						"size": schema.StringAttribute{
-							Description: "The size of each volume. E.g. 100G.",
-							Optional:    true,
+							Description: "The size of each volume.",
 							Computed:    true,
 							PlanModifiers: []planmodifier.String{
 								stringplanmodifier.UseStateForUnknown(),
 							},
 						},
 						"pool": schema.StringAttribute{
-							Description: "Name of the storage pool to use. E.g. ebs on aws.",
-							Optional:    true,
+							Description: "Name of the storage pool to use.",
 							Computed:    true,
 							PlanModifiers: []planmodifier.String{
 								stringplanmodifier.UseStateForUnknown(),
@@ -201,22 +212,14 @@ func (r *applicationResource) Schema(_ context.Context, _ resource.SchemaRequest
 						},
 						"count": schema.Int64Attribute{
 							Description: "The number of volumes.",
-							Optional:    true,
 							Computed:    true,
-							Default:     int64default.StaticInt64(int64(1)),
 							PlanModifiers: []planmodifier.Int64{
 								int64planmodifier.UseStateForUnknown(),
 							},
 						},
 					},
 				},
-				Validators: []validator.Set{
-					setNestedIsAttributeUniqueValidator{
-						PathExpressions: path.MatchRelative().AtAnySetValue().MergeExpressions(path.MatchRelative().AtName("label")),
-					},
-				},
 				PlanModifiers: []planmodifier.Set{
-					setplanmodifier.RequiresReplaceIf(storageSetRequiresReplace, "", ""),
 					setplanmodifier.UseStateForUnknown(),
 				},
 			},
@@ -537,38 +540,20 @@ func (r *applicationResource) Create(ctx context.Context, req resource.CreateReq
 
 	// Parse storage
 	var storageConstraints map[string]jujustorage.Constraints
-	if !plan.Storage.IsUnknown() {
-		var storageSlice []nestedStorage
-		resp.Diagnostics.Append(plan.Storage.ElementsAs(ctx, &storageSlice, false)...)
+	if !plan.StorageDirectives.IsUnknown() {
+		storageDirectives := make(map[string]string)
+		resp.Diagnostics.Append(plan.StorageDirectives.ElementsAs(ctx, &storageDirectives, false)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		if len(storageSlice) > 0 {
-			storageConstraints = make(map[string]jujustorage.Constraints)
-			for _, storage := range storageSlice {
-				r.trace("Creating application, storage values", map[string]interface{}{"storage": storage.transformToString()})
-				storageName := storage.Label.ValueString()
-				storageSize := storage.Size.ValueString()
-				storagePool := storage.Pool.ValueString()
-				storageCount := storage.Count.ValueInt64()
-
-				// Validate storage size
-				var parsedStorageSize uint64
-				if storageSize != "" {
-					var err error
-					parsedStorageSize, err = utils.ParseSize(storageSize)
-					if err != nil {
-						resp.Diagnostics.AddError("Invalid Storage Size", fmt.Sprintf("Invalid storage size %q: %s", storageSize, err))
-						return
-					}
-				}
-
-				storageConstraints[storageName] = jujustorage.Constraints{
-					Size:  parsedStorageSize,
-					Pool:  storagePool,
-					Count: uint64(storageCount),
-				}
+		storageConstraints = make(map[string]jujustorage.Constraints, len(storageDirectives))
+		for k, v := range storageDirectives {
+			result, err := jujustorage.ParseConstraints(v)
+			if err != nil {
+				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to parse storage directives, got error: %s", err))
+				return
 			}
+			storageConstraints[k] = result
 		}
 	}
 
@@ -641,42 +626,25 @@ func (r *applicationResource) Create(ctx context.Context, req resource.CreateReq
 		return
 	}
 
-	if plan.Storage.IsUnknown() {
-		var getStorageConstraintBytes []byte
-		getStorageConstraintBytes, dErr = resp.Private.GetKey(ctx, "storage")
+	storageType := req.Config.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
+	var nestedStorageSlice []nestedStorage
+	for name, storage := range readResp.Storage {
+		humanizedSize := transformSizeToHumanizedFormat(storage.Size)
+		nestedStorageSlice = append(nestedStorageSlice, nestedStorage{
+			Label: types.StringValue(name),
+			Size:  types.StringValue(humanizedSize),
+			Pool:  types.StringValue(storage.Pool),
+			Count: types.Int64Value(int64(storage.Count)),
+		})
+	}
+	if len(nestedStorageSlice) > 0 {
+		plan.Storage, dErr = types.SetValueFrom(ctx, storageType, nestedStorageSlice)
 		if dErr.HasError() {
 			resp.Diagnostics.Append(dErr...)
 			return
 		}
-		var privateStorageConstraints map[string]jujustorage.Constraints
-		if len(getStorageConstraintBytes) > 0 {
-			if err = json.Unmarshal(getStorageConstraintBytes, &privateStorageConstraints); err != nil {
-				resp.Diagnostics.AddError("Internal Error", fmt.Sprintf("Unable to unmarshal storage constraints, got error: %s", err))
-				return
-			}
-		}
-		storageType := req.Config.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
-		var nestedStorageSlice []nestedStorage
-		for name, storage := range readResp.Storage {
-			if _, ok := privateStorageConstraints[name]; !ok {
-				humanizedSize := transformSizeToHumanizedFormat(storage.Size)
-				nestedStorageSlice = append(nestedStorageSlice, nestedStorage{
-					Label: types.StringValue(name),
-					Size:  types.StringValue(humanizedSize),
-					Pool:  types.StringValue(storage.Pool),
-					Count: types.Int64Value(int64(storage.Count)),
-				})
-			}
-		}
-		if len(nestedStorageSlice) > 0 {
-			plan.Storage, dErr = types.SetValueFrom(ctx, storageType, nestedStorageSlice)
-			if dErr.HasError() {
-				resp.Diagnostics.Append(dErr...)
-				return
-			}
-		} else {
-			plan.Storage = types.SetNull(storageType)
-		}
+	} else {
+		plan.Storage = types.SetNull(storageType)
 	}
 
 	plan.ID = types.StringValue(newAppID(plan.ModelName.ValueString(), createResp.AppName))
@@ -822,28 +790,28 @@ func (r *applicationResource) Read(ctx context.Context, req resource.ReadRequest
 	// trace private storage constraints
 	r.trace("read private storage constraints", map[string]interface{}{"privateStorageConstraints": privateStorageConstraints})
 
-	if state.Storage.IsUnknown() {
-		// convert the storage map to a list of nestedStorage
-		nestedStorageSlice := make([]nestedStorage, 0, len(response.Storage))
-		for name, storage := range response.Storage {
-			if _, ok := privateStorageConstraints[name]; !ok {
-				humanizedSize := transformSizeToHumanizedFormat(storage.Size)
-				nestedStorageSlice = append(nestedStorageSlice, nestedStorage{
-					Label: types.StringValue(name),
-					Size:  types.StringValue(humanizedSize),
-					Pool:  types.StringValue(storage.Pool),
-					Count: types.Int64Value(int64(storage.Count)),
-				})
-			}
+	// convert the storage map to a list of nestedStorage
+	nestedStorageSlice := make([]nestedStorage, 0, len(response.Storage))
+	for name, storage := range response.Storage {
+		if _, ok := privateStorageConstraints[name]; !ok {
+			humanizedSize := transformSizeToHumanizedFormat(storage.Size)
+			nestedStorageSlice = append(nestedStorageSlice, nestedStorage{
+				Label: types.StringValue(name),
+				Size:  types.StringValue(humanizedSize),
+				Pool:  types.StringValue(storage.Pool),
+				Count: types.Int64Value(int64(storage.Count)),
+			})
 		}
-		if len(nestedStorageSlice) > 0 {
-			storageType := req.State.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
-			state.Storage, dErr = types.SetValueFrom(ctx, storageType, nestedStorageSlice)
-			if dErr.HasError() {
-				resp.Diagnostics.Append(dErr...)
-				return
-			}
+	}
+	storageType := req.State.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
+	if len(nestedStorageSlice) > 0 {
+		state.Storage, dErr = types.SetValueFrom(ctx, storageType, nestedStorageSlice)
+		if dErr.HasError() {
+			resp.Diagnostics.Append(dErr...)
+			return
 		}
+	} else {
+		state.Storage = types.SetNull(storageType)
 	}
 
 	resourceType := req.State.Schema.GetAttributes()[ResourceKey].(schema.MapAttribute).ElementType
@@ -1077,9 +1045,9 @@ func (r *applicationResource) Update(ctx context.Context, req resource.UpdateReq
 	}
 
 	if !plan.EndpointBindings.Equal(state.EndpointBindings) {
-		endpointBindings, diag := r.computeEndpointBindingsDeltas(ctx, state.EndpointBindings, plan.EndpointBindings)
-		if diag.HasError() {
-			resp.Diagnostics.Append(diag...)
+		endpointBindings, dErr := r.computeEndpointBindingsDeltas(ctx, state.EndpointBindings, plan.EndpointBindings)
+		if dErr.HasError() {
+			resp.Diagnostics.Append(dErr...)
 			return
 		}
 		updateApplicationInput.EndpointBindings = endpointBindings
@@ -1087,21 +1055,61 @@ func (r *applicationResource) Update(ctx context.Context, req resource.UpdateReq
 
 	// Check if we have new storage in plan that not existed in the state, and add their constraints to the
 	// update application input.
-	if !plan.Storage.Equal(state.Storage) {
-		if !plan.Storage.IsUnknown() {
-			if r.updateStorage(ctx, resp, plan, state, updateApplicationInput) {
-				return
-			}
+	if !plan.StorageDirectives.Equal(state.StorageDirectives) {
+		directives, dErr := r.updateStorage(ctx, plan, state)
+		resp.Diagnostics.Append(dErr...)
+		if resp.Diagnostics.HasError() {
+			return
 		}
-		if len(updateApplicationInput.StorageConstraints) == 0 {
-			storageType := req.Config.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
-			plan.Storage = types.SetNull(storageType)
-		}
+		updateApplicationInput.StorageConstraints = directives
 	}
 
 	if err := r.client.Applications.UpdateApplication(&updateApplicationInput); err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update application resource, got error: %s", err))
 		return
+	}
+
+	// If the plan has refreshed the charm, changed the unit count,
+	// or changed placement, wait for the changes to be seen in
+	// status. Including storage as it can be added on a refresh.
+	storageType := req.Config.Schema.GetAttributes()[StorageKey].(schema.SetNestedAttribute).NestedObject.Type()
+	if updateApplicationInput.Channel != "" ||
+		updateApplicationInput.Revision != nil ||
+		updateApplicationInput.Placement != nil ||
+		updateApplicationInput.Units != nil {
+
+		readResp, err := r.client.Applications.ReadApplicationWithRetryOnNotFound(ctx, &juju.ReadApplicationInput{
+			ModelName: updateApplicationInput.ModelName,
+			AppName:   updateApplicationInput.AppName,
+		})
+		if err != nil {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read application resource after update, got error: %s", err))
+			return
+		}
+		plan.Placement = types.StringValue(readResp.Placement)
+
+		var nestedStorageSlice []nestedStorage
+		for name, storage := range readResp.Storage {
+			humanizedSize := transformSizeToHumanizedFormat(storage.Size)
+			nestedStorageSlice = append(nestedStorageSlice, nestedStorage{
+				Label: types.StringValue(name),
+				Size:  types.StringValue(humanizedSize),
+				Pool:  types.StringValue(storage.Pool),
+				Count: types.Int64Value(int64(storage.Count)),
+			})
+		}
+		if len(nestedStorageSlice) > 0 {
+			var dErr diag.Diagnostics
+			plan.Storage, dErr = types.SetValueFrom(ctx, storageType, nestedStorageSlice)
+			if dErr.HasError() {
+				resp.Diagnostics.Append(dErr...)
+				return
+			}
+		} else {
+			plan.Storage = types.SetNull(storageType)
+		}
+	} else {
+		plan.Storage = state.Storage
 	}
 
 	plan.ID = types.StringValue(newAppID(plan.ModelName.ValueString(), plan.ApplicationName.ValueString()))
@@ -1110,58 +1118,42 @@ func (r *applicationResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-func (r *applicationResource) updateStorage(ctx context.Context, resp *resource.UpdateResponse, plan applicationResourceModel, state applicationResourceModel, updateApplicationInput juju.UpdateApplicationInput) bool {
-	var planStorageSlice, stateStorageSlice []nestedStorage
-	resp.Diagnostics.Append(plan.Storage.ElementsAs(ctx, &planStorageSlice, false)...)
-	if resp.Diagnostics.HasError() {
-		return true
+// updateStorage compares the plan storage directives to the
+// state storage directives, any new labels are returned to be
+// added as storage constraints.
+func (r *applicationResource) updateStorage(
+	ctx context.Context,
+	plan applicationResourceModel,
+	state applicationResourceModel,
+) (map[string]jujustorage.Constraints, diag.Diagnostics) {
+	diagnostics := diag.Diagnostics{}
+	var updatedStorageDirectivesMap map[string]jujustorage.Constraints
+
+	var planStorageDirectives, stateStorageDirectives map[string]string
+	diagnostics.Append(plan.StorageDirectives.ElementsAs(ctx, &planStorageDirectives, false)...)
+	if diagnostics.HasError() {
+		return updatedStorageDirectivesMap, diagnostics
 	}
-	resp.Diagnostics.Append(state.Storage.ElementsAs(ctx, &stateStorageSlice, false)...)
-	if resp.Diagnostics.HasError() {
-		return true
+	diagnostics.Append(state.StorageDirectives.ElementsAs(ctx, &stateStorageDirectives, false)...)
+	if diagnostics.HasError() {
+		return updatedStorageDirectivesMap, diagnostics
 	}
 
-	// Map of storage name to storage constraints
-	planStorageMap := make(map[string]jujustorage.Constraints)
-	for _, storage := range planStorageSlice {
-		// Validate storage size
-		parsedSize, err := utils.ParseSize(storage.Size.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Invalid Storage Size", fmt.Sprintf("Invalid storage size %q: %s", storage.Size.ValueString(), err))
-			return true
-		}
-		planStorageMap[storage.Label.ValueString()] = jujustorage.Constraints{
-			Size:  parsedSize,
-			Pool:  storage.Pool.ValueString(),
-			Count: uint64(storage.Count.ValueInt64()),
-		}
-	}
-	stateStorageMap := make(map[string]jujustorage.Constraints)
-	for _, storage := range stateStorageSlice {
-		// Validate storage size
-		parsedSize, err := utils.ParseSize(storage.Size.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Invalid Storage Size", fmt.Sprintf("Invalid storage size %q: %s", storage.Size.ValueString(), err))
-			return true
-		}
-		stateStorageMap[storage.Label.ValueString()] = jujustorage.Constraints{
-			Size:  parsedSize,
-			Pool:  storage.Pool.ValueString(),
-			Count: uint64(storage.Count.ValueInt64()),
+	// Create a map of updated storage directives that are in the plan but not in the state
+	updatedStorageDirectivesMap = make(map[string]jujustorage.Constraints)
+	for label, constraintString := range planStorageDirectives {
+		if _, ok := stateStorageDirectives[label]; !ok {
+			cons, err := jujustorage.ParseConstraints(constraintString)
+			if err != nil {
+				// Just in case, as this should have been validated out before now.
+				diagnostics.AddError("Client Error", fmt.Sprintf("Unable to parse storage directives, got error: %s", err))
+				continue
+			}
+			updatedStorageDirectivesMap[label] = cons
 		}
 	}
 
-	// Create a map of updated storage constraints that are in the plan but not in the state
-	updatedStorageMap := make(map[string]jujustorage.Constraints)
-	for _, storage := range planStorageSlice {
-		if _, ok := stateStorageMap[storage.Label.ValueString()]; !ok {
-			updatedStorageMap[storage.Label.ValueString()] = planStorageMap[storage.Label.ValueString()]
-		}
-	}
-
-	// Update the storage constraints for the application
-	updateApplicationInput.StorageConstraints = updatedStorageMap
-	return false
+	return updatedStorageDirectivesMap, diagnostics
 }
 
 // computeExposeDeltas computes the differences between the previously

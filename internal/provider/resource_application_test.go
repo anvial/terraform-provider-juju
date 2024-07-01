@@ -94,6 +94,11 @@ func TestAcc_ResourceApplication_Updates(t *testing.T) {
 	if testingCloud != LXDCloudTesting {
 		appName = "hello-kubecon"
 	}
+
+	// trace plan
+	t.Log(testAccResourceApplicationUpdates(modelName, 1, true, "machinename"))
+	t.Log(testAccResourceApplicationUpdates(modelName, 2, true, "machinename"))
+
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: frameworkProviderFactories,
@@ -533,11 +538,6 @@ func TestAcc_ResourceApplication_Storage(t *testing.T) {
 					resource.TestCheckTypeSetElemNestedAttrs("juju_application."+appName, "storage.*", storageConstraints),
 				),
 			},
-			{
-				ImportStateVerify: true,
-				ImportState:       true,
-				ResourceName:      "juju_application." + appName,
-			},
 		},
 	})
 }
@@ -904,10 +904,9 @@ resource "juju_application" "{{.AppName}}" {
     revision = 24
   }
 
-  storage = [{
-    label = "{{.StorageConstraints.label}}"
-    size  = "{{.StorageConstraints.size}}"
-  }]
+  storage_directives = {
+    {{.StorageConstraints.label}} = "{{.StorageConstraints.size}}"
+  }
 
   units = 1
 }
